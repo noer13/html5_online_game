@@ -102,6 +102,7 @@
     let player, entities = [], particles = [], otherPlayers = {};
     let isRunning = false;
     let isInvincible = false;
+    let isHost = false;
     let camera = { x: 0, y: 0 };
     let mouse = { x: 0, y: 0 };
     const WORLD_SIZE = 4000;
@@ -109,7 +110,7 @@
 
     // --- МЕРЕЖЕВИЙ КОД ---
     const peer = new Peer();
-    let connection;
+    let connections = []; // Масив для хоста
 
     peer.on('open', id => {
         currentID = id;
@@ -117,10 +118,15 @@
         document.getElementById('game-id-display').innerText = id;
     });
 
+    // Коли хтось підключається до нас (ми хост)
+    peer.on('connection', conn => {
+        connections.push(conn);
+        setupConnection(conn);
+    });
+
     function copyID() {
         if (!currentID) return;
         navigator.clipboard.writeText(currentID);
-        // Візуальний зворотний зв'язок замість alert для ID
         const display = document.getElementById('game-id-display');
         const oldText = display.innerText;
         display.innerText = "СКОПІЙОВАНО!";
@@ -130,44 +136,55 @@
     function joinGame() {
         const id = document.getElementById('join-id').value;
         if (!id) return;
-        connection = peer.connect(id);
-        setupNetworking();
+        const conn = peer.connect(id);
+        setupConnection(conn);
         startGame(false);
     }
 
-    function setupNetworking() {
-        connection.on('open', () => {
+    function setupConnection(conn) {
+        conn.on('open', () => {
+            // Регулярна відправка своїх даних
             setInterval(() => {
                 if (player && isRunning) {
-                    connection.send({
-                        type: 'sync', id: peer.id, x: player.x, y: player.y,
-                        radius: player.radius, color: player.color,
-                        name: player.name, angle: player.angle
+                    conn.send({
+                        type: 'sync-player',
+                        id: peer.id,
+                        x: player.x,
+                        y: player.y,
+                        radius: player.radius,
+                        color: player.color,
+                        name: player.name,
+                        angle: player.angle
                     });
+                    
+                    // Якщо ми хост, розсилаємо стан усіх ботів
+                    if (isHost) {
+                        conn.send({
+                            type: 'sync-entities',
+                            entities: entities.map(e => ({
+                                id: e.id, x: e.x, y: e.y, radius: e.radius, color: e.color, name: e.name
+                            }))
+                        });
+                    }
                 }
             }, 50);
         });
-        connection.on('data', data => { if (data.type === 'sync') otherPlayers[data.id] = data; });
+
+        conn.on('data', data => {
+            if (data.type === 'sync-player') {
+                otherPlayers[data.id] = data;
+            }
+            if (data.type === 'sync-entities' && !isHost) {
+                // Клієнт отримує ботів від хоста
+                entities = data.entities.map(e => {
+                    let bot = new Entity(e.id, e.x, e.y, e.radius, e.color, e.name, true);
+                    return bot;
+                });
+            }
+        });
     }
 
     // --- ЛОГІКА ГРИ ---
-    class Particle {
-        constructor(x, y, color) {
-            this.x = x; this.y = y; this.color = color;
-            this.size = Math.random() * 4 + 2;
-            this.speedX = (Math.random() - 0.5) * 4;
-            this.speedY = (Math.random() - 0.5) * 4;
-            this.life = 1.0;
-        }
-        update() { this.x += this.speedX; this.y += this.speedY; this.life -= 0.02; }
-        draw() {
-            ctx.globalAlpha = this.life;
-            ctx.fillStyle = this.color;
-            ctx.beginPath(); ctx.arc(this.x, this.y, this.size, 0, Math.PI * 2); ctx.fill();
-            ctx.globalAlpha = 1;
-        }
-    }
-
     class Entity {
         constructor(id, x, y, radius, color, name, isBot = false) {
             this.id = id; this.x = x; this.y = y;
@@ -203,13 +220,14 @@
         }
 
         update() {
-            if (this.isBot) {
+            if (this.isBot && isHost) { // Тільки хост прораховує рух ботів
                 let nearest = null;
                 let minDist = 400;
                 let danger = null;
 
                 let targets = [...entities];
                 if (player && !isInvincible) targets.push(player);
+                for(let id in otherPlayers) targets.push(otherPlayers[id]);
 
                 targets.forEach(other => {
                     if (other === this || !other) return;
@@ -232,20 +250,18 @@
                 this.x += Math.cos(this.angle) * (this.speed * 0.6);
                 this.y += Math.sin(this.angle) * (this.speed * 0.6);
 
-                let changed = false;
-                if (this.x < this.radius) { this.x = this.radius; changed = true; }
-                if (this.x > WORLD_SIZE - this.radius) { this.x = WORLD_SIZE - this.radius; changed = true; }
-                if (this.y < this.radius) { this.y = this.radius; changed = true; }
-                if (this.y > WORLD_SIZE - this.radius) { this.y = WORLD_SIZE - this.radius; changed = true; }
-                if (changed) this.targetAngle = Math.atan2(WORLD_SIZE/2 - this.y, WORLD_SIZE/2 - this.x) + (Math.random() - 0.5);
+                if (this.x < this.radius || this.x > WORLD_SIZE - this.radius || this.y < this.radius || this.y > WORLD_SIZE - this.radius) {
+                    this.targetAngle = Math.atan2(WORLD_SIZE/2 - this.y, WORLD_SIZE/2 - this.x);
+                }
             }
         }
     }
 
-    function startGame(hostBots) {
+    function startGame(hostMode) {
+        isHost = hostMode;
         spawnPlayer();
-        if (hostBots) {
-            entities = []; // Очистка при новому хості
+        if (isHost) {
+            entities = [];
             for (let i = 0; i < 70; i++) spawnBot();
         }
         isRunning = true;
@@ -265,16 +281,12 @@
 
     function respawnPlayer() {
         deathScreen.style.display = 'none';
-        const oldSize = player.radius;
-        const oldLvl = player.level;
         spawnPlayer();
-        player.radius = Math.max(20, oldSize * 0.6);
-        player.level = Math.max(1, Math.floor(oldLvl * 0.7));
         isRunning = true;
     }
 
     function spawnBot() {
-        const names = ["Amoeba", "Virus", "Cell", "Bacteria", "Hunter", "Proto"];
+        const names = ["Amoeba", "Virus", "Cell", "Bacteria", "Hunter"];
         entities.push(new Entity(Math.random(), Math.random()*WORLD_SIZE, Math.random()*WORLD_SIZE, 12 + Math.random()*25, `hsl(${Math.random()*360}, 60%, 50%)`, names[Math.floor(Math.random()*names.length)], true));
     }
 
@@ -286,42 +298,21 @@
     }
 
     function handleCollisions() {
-        // Колізії гравця
         if (!isInvincible) {
             for (let i = entities.length - 1; i >= 0; i--) {
                 let ent = entities[i];
                 let d = Math.hypot(player.x - ent.x, player.y - ent.y);
                 if (d < player.radius + ent.radius * 0.6) {
                     if (player.radius > ent.radius) {
-                        for(let k=0; k<10; k++) particles.push(new Particle(ent.x, ent.y, ent.color));
                         player.xp += 45; player.radius += 0.5;
-                        entities.splice(i, 1); spawnBot();
+                        if (isHost) { entities.splice(i, 1); spawnBot(); }
                         if (player.xp >= player.level * 100) {
                             player.level++; player.xp = 0;
                             isRunning = false; isInvincible = true;
                             document.getElementById('level-up').style.display = 'block';
                         }
                     } else {
-                        isRunning = false;
-                        deathScreen.style.display = 'flex';
-                        for(let k=0; k<20; k++) particles.push(new Particle(player.x, player.y, player.color));
-                    }
-                }
-            }
-        }
-
-        // --- НОВЕ: ПОЛЮВАННЯ AI ОДИН НА ОДНОГО ---
-        for (let i = entities.length - 1; i >= 0; i--) {
-            for (let j = entities.length - 1; j >= 0; j--) {
-                if (i === j) continue;
-                let a = entities[i]; let b = entities[j];
-                if (!a || !b) continue;
-                let d = Math.hypot(a.x - b.x, a.y - b.y);
-                if (d < a.radius + b.radius * 0.5) {
-                    if (a.radius > b.radius * 1.1) {
-                        a.radius += b.radius * 0.1;
-                        entities.splice(j, 1);
-                        spawnBot();
+                        isRunning = false; deathScreen.style.display = 'flex';
                     }
                 }
             }
@@ -353,15 +344,13 @@
             ctx.beginPath(); ctx.moveTo(0, i); ctx.lineTo(WORLD_SIZE, i); ctx.stroke();
         }
 
-        particles = particles.filter(p => p.life > 0);
-        particles.forEach(p => { p.update(); p.draw(); });
-        entities.forEach(e => { e.update(); e.draw(); });
+        entities.forEach(e => { if(isHost) e.update(); e.draw(); });
         
         for (let id in otherPlayers) {
             let p = otherPlayers[id];
             ctx.fillStyle = p.color;
             ctx.beginPath(); ctx.arc(p.x, p.y, p.radius, 0, Math.PI*2); ctx.fill();
-            ctx.fillStyle = "white"; ctx.textAlign = "center";
+            ctx.fillStyle = "white"; ctx.textAlign = "center"; ctx.font = "bold 13px Arial";
             ctx.fillText(p.name, p.x, p.y - p.radius - 10);
         }
 
