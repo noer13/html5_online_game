@@ -1,3 +1,4 @@
+
 <!DOCTYPE html>
 <html lang="uk">
 <head>
@@ -36,6 +37,9 @@
         #stats { position: absolute; top: 15px; left: 15px; pointer-events: none; z-index: 5; }
         .xp-bar { width: 200px; height: 10px; background: rgba(255,255,255,0.1); border-radius: 5px; overflow: hidden; margin-top: 5px; }
         #xp-fill { width: 0%; height: 100%; background: #00ffcc; transition: 0.2s; }
+
+        #game-log { position: absolute; bottom: 20px; left: 20px; pointer-events: none; z-index: 100; font-family: monospace; display: flex; flex-direction: column-reverse; gap: 5px; }
+        @keyframes fadeIn { from { opacity: 0; transform: translateX(-20px); } to { opacity: 1; transform: translateX(0); } }
     </style>
 </head>
 <body>
@@ -48,13 +52,15 @@
 
     <div id="game-id-container">
         <small>Ваш ID (клік для копіювання):</small><br>
-        <b id="game-id-display" onclick="copyID()">Завантаження...</b>
+        <b id="game-id-display" onclick="copyID('game-id-display')">Завантаження...</b>
     </div>
+
+    <div id="game-log"></div>
 
     <div id="ui">
         <div class="menu">
             <h1>EVOLUTION</h1>
-            <div id="my-id" onclick="copyID()">Завантаження мережі...</div>
+            <div id="my-id" onclick="copyID('my-id')">Завантаження мережі...</div>
             <input type="text" id="username" placeholder="Твоє ім'я" maxlength="12"><br>
             <label>Колір:</label> <input type="color" id="usercolor" value="#00ffcc"><br>
             <button class="btn" onclick="startGame(true)">СТАТИ ХОСТОМ / СОЛО</button>
@@ -89,7 +95,7 @@
     <canvas id="gameCanvas"></canvas>
 
 <script>
-   const canvas = document.getElementById('gameCanvas');
+    const canvas = document.getElementById('gameCanvas');
     const ctx = canvas.getContext('2d');
     const ui = document.getElementById('ui');
     const deathScreen = document.getElementById('death-screen');
@@ -109,9 +115,31 @@
     let myID = "";
     let hostID = "";
 
-    // --- МЕРЕЖЕВИЙ КОД ---
     const peer = new Peer();
     let connections = []; 
+
+    function addLog(text, color = "white") {
+        const logContainer = document.getElementById('game-log');
+        const entry = document.createElement('div');
+        entry.style.color = color;
+        entry.style.background = "rgba(0,0,0,0.5)";
+        entry.style.padding = "4px 10px";
+        entry.style.borderRadius = "4px";
+        entry.style.fontSize = "13px";
+        entry.style.animation = "fadeIn 0.3s ease";
+        entry.innerText = text;
+        
+        logContainer.appendChild(entry);
+        
+        setTimeout(() => {
+            entry.style.opacity = "0"; entry.style.transition = "1s";
+            setTimeout(() => entry.remove(), 1000);
+        }, 7000);
+    }
+
+    function broadcast(data) {
+        connections.forEach(c => { if(c.open) c.send(data); });
+    }
 
     peer.on('open', id => {
         myID = id;
@@ -121,16 +149,50 @@
     peer.on('connection', conn => {
         if (!isHost) return;
         connections.push(conn);
+        
+        conn.on('data', data => {
+            if (data.type === 'sync-player' && !otherPlayers[data.id]) {
+                const msg = `Гравець ${data.name} приєднався до еволюції`;
+                addLog(msg, "#00ff88");
+                broadcast({ type: 'sys-log', text: msg, color: "#00ff88" });
+            }
+        });
+
+        conn.on('close', () => {
+            const playerInfo = otherPlayers[conn.peer];
+            const name = playerInfo ? playerInfo.name : "Невідомий гравець";
+            
+            const msg = `Гравець ${name} покинув світ`;
+            addLog(msg, "#ffcc00");
+            broadcast({ type: 'sys-log', text: msg, color: "#ffcc00" });
+            
+            delete otherPlayers[conn.peer];
+            connections = connections.filter(c => c !== conn);
+        });
+
         setupConnection(conn);
     });
 
-    function copyID() {
-        const idToCopy = isHost ? myID : hostID;
+    function copyID(elementId) {
+        let idToCopy = "";
+        if (elementId === 'my-id') {
+            idToCopy = myID;
+        } else if (elementId === 'game-id-display') {
+            idToCopy = isHost ? myID : hostID;
+        }
+
         if (!idToCopy) return;
-        navigator.clipboard.writeText(idToCopy);
-        const display = document.getElementById('game-id-display');
-        display.innerText = "СКОПІЙОВАНО!";
-        setTimeout(() => display.innerText = idToCopy, 1000);
+
+        navigator.clipboard.writeText(idToCopy).then(() => {
+            const display = document.getElementById(elementId);
+            const oldText = display.innerText;
+            display.innerText = "СКОПІЙОВАНО!";
+            setTimeout(() => {
+                display.innerText = oldText.includes("ID: ") ? "Ваш ID: " + idToCopy : idToCopy;
+            }, 1000);
+        }).catch(err => {
+            console.error('Помилка копіювання: ', err);
+        });
     }
 
     function joinGame() {
@@ -145,7 +207,7 @@
     function setupConnection(conn) {
         conn.on('open', () => {
             setInterval(() => {
-                if (player && isRunning) {
+                if (player) {
                     conn.send({
                         type: 'sync-player',
                         id: myID,
@@ -154,7 +216,8 @@
                         radius: player.radius,
                         color: player.color,
                         name: player.name,
-                        angle: player.angle
+                        angle: player.angle,
+                        isDead: !isRunning
                     });
                     
                     if (isHost) {
@@ -167,42 +230,83 @@
                         });
                     }
                 }
-            }, 40);
+            }, 35);
         });
 
         conn.on('data', data => {
             if (data.type === 'sync-player') {
-                otherPlayers[data.id] = data;
+                if (data.isDead) {
+                    if (otherPlayers[data.id]) otherPlayers[data.id].isDead = true;
+                } else {
+                    if (!otherPlayers[data.id]) {
+                        otherPlayers[data.id] = {...data, targetX: data.x, targetY: data.y};
+                    } else {
+                        let p = otherPlayers[data.id];
+                        p.targetX = data.x; p.targetY = data.y;
+                        p.radius = data.radius; p.angle = data.angle; p.isDead = false;
+                    }
+                }
             }
             if (data.type === 'sync-world' && !isHost) {
-                // Оновлюємо існуючих ботів замість створення нових щосекунди
-                entities = data.entities.map(e => {
-                    let ent = new Entity(e.id, e.x, e.y, e.radius, e.color, e.name, true);
-                    ent.angle = e.angle;
-                    return ent;
+                data.entities.forEach(serverBot => {
+                    let localBot = entities.find(b => b.id === serverBot.id);
+                    if (!localBot) {
+                        localBot = new Entity(serverBot.id, serverBot.x, serverBot.y, serverBot.radius, serverBot.color, serverBot.name, true);
+                        entities.push(localBot);
+                    }
+                    localBot.targetX = serverBot.x;
+                    localBot.targetY = serverBot.y;
+                    localBot.radius = serverBot.radius;
+                    localBot.angle = serverBot.angle;
                 });
-                for (let id in data.players) {
-                    if (id !== myID) otherPlayers[id] = data.players[id];
-                }
+                entities = entities.filter(lb => data.entities.some(sb => sb.id === lb.id));
+            }
+            
+            if (data.type === 'sys-log') {
+                addLog(data.text, data.color);
+            }
+
+            if (isHost && data.type === 'request-log') {
+                addLog(data.text, data.color);
+                broadcast({ type: 'sys-log', text: data.text, color: data.color });
+            }
+
+            if (data.type === 'eat-success') {
+                player.xp += 45; 
+                player.radius += 0.4;
+                checkLevelUp();
+            }
+
+            if (data.type === 'you-died') {
+                isRunning = false;
+                deathScreen.style.display = 'flex';
             }
         });
     }
 
-    // --- ЛОГІКА ГРИ ---
     class Entity {
         constructor(id, x, y, radius, color, name, isBot = false) {
             this.id = id; this.x = x; this.y = y;
+            this.targetX = x; this.targetY = y;
             this.radius = radius; this.color = color;
             this.name = name; this.isBot = isBot;
             this.speed = 2.5; this.level = 1; this.xp = 0;
-            this.angle = Math.random() * Math.PI * 2;
-            this.targetAngle = this.angle;
+            this.angle = 0; this.targetAngle = 0;
         }
 
         draw() {
+            if (this.isDead && this.id !== 'me') return;
+
+            if (this.id !== 'me' && (!isHost || !this.isBot)) {
+                if (this.targetX !== undefined) {
+                    this.x += (this.targetX - this.x) * 0.2;
+                    this.y += (this.targetY - this.y) * 0.2;
+                }
+            }
+
             ctx.save();
             ctx.translate(this.x, this.y);
-            if (this.id === 'me' && isInvincible) ctx.globalAlpha = 0.5;
+            if (this.id === 'me' && (isInvincible || !isRunning)) ctx.globalAlpha = 0.5;
 
             let pulse = Math.sin(Date.now() * 0.005) * 2;
             ctx.beginPath(); ctx.arc(0, 0, this.radius + pulse, 0, Math.PI * 2);
@@ -226,58 +330,117 @@
         updateAI() {
             if (!this.isBot || !isHost) return;
 
-            let nearest = null;
-            let minDist = 400;
-            let danger = null;
-
-            // Збираємо всіх потенційних цілей
-            let targets = [...entities, player];
-            for(let id in otherPlayers) targets.push(otherPlayers[id]);
+            let nearest = null; let minDist = 600; let danger = null;
+            let targets = [...entities];
+            if (isRunning && !player.isDead) targets.push(player);
+            for(let id in otherPlayers) if (!otherPlayers[id].isDead) targets.push(otherPlayers[id]);
 
             targets.forEach(other => {
                 if (!other || other.id === this.id) return;
                 let d = Math.hypot(this.x - other.x, this.y - other.y);
-                
-                if (d < 300 && other.radius > this.radius * 1.1) {
-                    danger = other;
-                } else if (d < minDist && other.radius < this.radius) {
-                    minDist = d; nearest = other;
-                }
+                if (d < 400 && other.radius > this.radius * 1.1) danger = other;
+                else if (d < minDist && other.radius < this.radius) { minDist = d; nearest = other; }
             });
 
-            if (danger) {
-                this.targetAngle = Math.atan2(this.y - danger.y, this.x - danger.x);
-            } else if (nearest) {
-                this.targetAngle = Math.atan2(nearest.y - this.y, nearest.x - this.x);
-            }
+            if (danger) this.targetAngle = Math.atan2(this.y - danger.y, this.x - danger.x);
+            else if (nearest) this.targetAngle = Math.atan2(nearest.y - this.y, nearest.x - this.x);
             
-            // Плавний поворот
             let diff = this.targetAngle - this.angle;
             while (diff < -Math.PI) diff += Math.PI * 2;
             while (diff > Math.PI) diff -= Math.PI * 2;
             this.angle += diff * 0.05;
 
-            this.x += Math.cos(this.angle) * (this.speed * 0.6);
-            this.y += Math.sin(this.angle) * (this.speed * 0.6);
-
-            // Межі світу
-            if (this.x < 50 || this.x > WORLD_SIZE - 50 || this.y < 50 || this.y > WORLD_SIZE - 50) {
-                this.targetAngle = Math.atan2(WORLD_SIZE/2 - this.y, WORLD_SIZE/2 - this.x);
-            }
+            this.x += Math.cos(this.angle) * (this.speed * 0.7);
+            this.y += Math.sin(this.angle) * (this.speed * 0.7);
+            
+            this.x = Math.max(this.radius, Math.min(WORLD_SIZE - this.radius, this.x));
+            this.y = Math.max(this.radius, Math.min(WORLD_SIZE - this.radius, this.y));
+            this.targetX = this.x; this.targetY = this.y;
         }
+    }
+
+    function animate() {
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        
+        if (isRunning && player) {
+            player.angle = Math.atan2(mouse.y - canvas.height/2, mouse.x - canvas.width/2);
+            player.x += Math.cos(player.angle) * player.speed;
+            player.y += Math.sin(player.angle) * player.speed;
+            
+            player.x = Math.max(player.radius, Math.min(WORLD_SIZE - player.radius, player.x));
+            player.y = Math.max(player.radius, Math.min(WORLD_SIZE - player.radius, player.y));
+        }
+
+        if (player) {
+            camera.x += (player.x - canvas.width/2 - camera.x) * 0.1;
+            camera.y += (player.y - canvas.height/2 - camera.y) * 0.1;
+        }
+
+        ctx.save();
+        ctx.translate(-camera.x, -camera.y);
+
+        ctx.strokeStyle = "rgba(0, 204, 255, 0.1)";
+        for(let i=0; i<=WORLD_SIZE; i+=200) {
+            ctx.beginPath(); ctx.moveTo(i, 0); ctx.lineTo(i, WORLD_SIZE); ctx.stroke();
+            ctx.beginPath(); ctx.moveTo(0, i); ctx.lineTo(WORLD_SIZE, i); ctx.stroke();
+        }
+
+        entities.forEach(e => { 
+            if(isHost) e.updateAI(); 
+            e.draw(); 
+        });
+        
+        for (let id in otherPlayers) {
+            let p = otherPlayers[id];
+            if (id === myID || p.isDead) continue;
+            
+            if (p.targetX !== undefined) {
+                p.x += (p.targetX - p.x) * 0.2;
+                p.y += (p.targetY - p.y) * 0.2;
+            }
+
+            ctx.save();
+            ctx.translate(p.x, p.y);
+            ctx.rotate(p.angle || 0);
+            ctx.fillStyle = p.color;
+            ctx.beginPath(); ctx.arc(0, 0, p.radius, 0, Math.PI*2); ctx.fill();
+            ctx.fillStyle = "white"; ctx.beginPath();
+            ctx.arc(p.radius*0.5, -p.radius*0.3, p.radius*0.22, 0, Math.PI*2);
+            ctx.arc(p.radius*0.5, p.radius*0.3, p.radius*0.22, 0, Math.PI*2);
+            ctx.fill(); ctx.restore();
+            ctx.fillStyle = "rgba(255,255,255,0.8)";
+            ctx.textAlign = "center"; ctx.fillText(p.name, p.x, p.y - p.radius - 12);
+        }
+
+        if (player) player.draw();
+        ctx.restore();
+
+        if (isHost) handleHostCollisions();
+        
+        if (!isHost && isRunning && !isInvincible && player) {
+            entities.forEach(ent => {
+                let d = Math.hypot(player.x - ent.x, player.y - ent.y);
+                if (d < ent.radius && ent.radius > player.radius * 1.1) {
+                    isRunning = false; deathScreen.style.display = 'flex';
+                }
+            });
+        }
+
+        if (player) {
+            xpFill.style.width = (player.xp / (player.level * 100) * 100) + "%";
+            lvlUi.innerText = player.level;
+        }
+        requestAnimationFrame(animate);
     }
 
     function startGame(hostMode) {
         isHost = hostMode;
         if (isHost) hostID = myID;
-        
         spawnPlayer();
-        
         if (isHost) {
             entities = [];
             for (let i = 0; i < 70; i++) spawnBot();
         }
-
         isRunning = true;
         ui.style.display = 'none';
         document.getElementById('game-id-container').style.display = 'block';
@@ -288,9 +451,8 @@
     function spawnPlayer() {
         const rx = Math.random() * (WORLD_SIZE - 400) + 200;
         const ry = Math.random() * (WORLD_SIZE - 400) + 200;
-        const color = document.getElementById('usercolor').value;
-        const name = document.getElementById('username').value || "Microbe";
-        player = new Entity('me', rx, ry, 20, color, name);
+        player = new Entity('me', rx, ry, 20, document.getElementById('usercolor').value, document.getElementById('username').value || "Microbe");
+        player.isDead = false;
         document.getElementById('player-name-ui').innerText = player.name;
     }
 
@@ -302,7 +464,77 @@
 
     function spawnBot() {
         const names = ["Amoeba", "Virus", "Cell", "Bacteria", "Hunter", "Crawler"];
-        entities.push(new Entity(Math.random(), Math.random()*WORLD_SIZE, Math.random()*WORLD_SIZE, 12 + Math.random()*25, `hsl(${Math.random()*360}, 60%, 50%)`, names[Math.floor(Math.random()*names.length)], true));
+        const id = Math.random().toString(36).substr(2, 9);
+        entities.push(new Entity(id, Math.random()*WORLD_SIZE, Math.random()*WORLD_SIZE, 12 + Math.random()*25, `hsl(${Math.random()*360}, 60%, 50%)`, names[Math.floor(Math.random()*names.length)], true));
+    }
+
+    function handleHostCollisions() {
+        if (!isHost) return;
+        let all = [...entities];
+        if (isRunning && !player.isDead) all.push(player);
+        for(let id in otherPlayers) if (!otherPlayers[id].isDead) all.push(otherPlayers[id]);
+
+        for (let i = 0; i < all.length; i++) {
+            for (let j = 0; j < all.length; j++) {
+                if (i === j) continue;
+                let a = all[i], b = all[j];
+                if (!a || !b) continue;
+                let dist = Math.hypot(a.x - b.x, a.y - b.y);
+                if (dist < a.radius * 0.9 && a.radius > b.radius * 1.05) processEat(a, b);
+            }
+        }
+    }
+
+    function processEat(winner, victim) {
+        let deathMsg = `${victim.name} поглинуто гравцем ${winner.name}`;
+
+        if (winner.id === 'me') {
+            player.xp += 45; player.radius += 0.4;
+            checkLevelUp();
+        } else if (winner.isBot) {
+            winner.radius += 0.2;
+        } else {
+            if (otherPlayers[winner.id]) {
+                otherPlayers[winner.id].radius += 0.4;
+                let conn = connections.find(c => c.peer === winner.id);
+                if (conn) conn.send({ type: 'eat-success' });
+            }
+        }
+
+        if (!winner.isBot || !victim.isBot) {
+                addLog(deathMsg, "#555555");
+                if (isHost) broadcast({ type: 'sys-log', text: deathMsg, color: "#555555" });
+        }
+
+        if (victim.isBot) {
+            let idx = entities.findIndex(e => e.id === victim.id);
+            if (idx !== -1) { entities.splice(idx, 1); spawnBot(); }
+        } else if (victim.id === 'me') {
+            isRunning = false; player.isDead = true;
+            deathScreen.style.display = 'flex';
+        } else {
+            let conn = connections.find(c => c.peer === victim.id);
+            if (conn) conn.send({ type: 'you-died' });
+            if (otherPlayers[victim.id]) otherPlayers[victim.id].isDead = true;
+        }
+    }
+
+    function checkLevelUp() {
+        if (player.xp >= player.level * 100) {
+            player.level++; player.xp = 0;
+            
+            let lvlMsg = `${player.name} досяг ${player.level} рівня!`;
+            addLog(lvlMsg, "#00ccff");
+            
+            if (isHost) broadcast({ type: 'sys-log', text: lvlMsg, color: "#00ccff" });
+            else {
+                let hostConn = connections[0];
+                if (hostConn) hostConn.send({ type: 'request-log', text: lvlMsg, color: "#00ccff" });
+            }
+
+            isRunning = false; isInvincible = true;
+            document.getElementById('level-up').style.display = 'block';
+        }
     }
 
     function chooseUpgrade(type) {
@@ -310,88 +542,6 @@
         if (type === 'size') player.radius += 5;
         document.getElementById('level-up').style.display = 'none';
         isInvincible = false; isRunning = true;
-    }
-
-    function animate() {
-        ctx.clearRect(0, 0, canvas.width, canvas.height);
-        
-        if (isRunning) {
-            player.angle = Math.atan2(mouse.y - canvas.height/2, mouse.x - canvas.width/2);
-            player.x += Math.cos(player.angle) * player.speed;
-            player.y += Math.sin(player.angle) * player.speed;
-            player.x = Math.max(player.radius, Math.min(WORLD_SIZE - player.radius, player.x));
-            player.y = Math.max(player.radius, Math.min(WORLD_SIZE - player.radius, player.y));
-        }
-
-        camera.x += (player.x - canvas.width/2 - camera.x) * 0.1;
-        camera.y += (player.y - canvas.height/2 - camera.y) * 0.1;
-
-        ctx.save();
-        ctx.translate(-camera.x, -camera.y);
-
-        // Сітка
-        ctx.strokeStyle = "rgba(0, 204, 255, 0.1)";
-        ctx.lineWidth = 2;
-        for(let i=0; i<=WORLD_SIZE; i+=200) {
-            ctx.beginPath(); ctx.moveTo(i, 0); ctx.lineTo(i, WORLD_SIZE); ctx.stroke();
-            ctx.beginPath(); ctx.moveTo(0, i); ctx.lineTo(WORLD_SIZE, i); ctx.stroke();
-        }
-
-        // Боти
-        entities.forEach(e => { 
-            if(isHost) e.updateAI(); 
-            e.draw(); 
-        });
-        
-        // Інші гравці
-        for (let id in otherPlayers) {
-            let p = otherPlayers[id];
-            if (id === myID) continue;
-            
-            ctx.save();
-            ctx.translate(p.x, p.y);
-            ctx.rotate(p.angle || 0);
-            ctx.fillStyle = p.color;
-            ctx.beginPath(); ctx.arc(0, 0, p.radius, 0, Math.PI*2); ctx.fill();
-            ctx.fillStyle = "white";
-            ctx.beginPath();
-            ctx.arc(p.radius * 0.5, -p.radius * 0.3, p.radius * 0.22, 0, Math.PI * 2);
-            ctx.arc(p.radius * 0.5, p.radius * 0.3, p.radius * 0.22, 0, Math.PI * 2);
-            ctx.fill();
-            ctx.restore();
-
-            ctx.fillStyle = "rgba(255,255,255,0.8)";
-            ctx.textAlign = "center"; ctx.font = "bold 13px Arial";
-            ctx.fillText(p.name, p.x, p.y - p.radius - 12);
-        }
-
-        player.draw();
-        ctx.restore();
-
-        // Колізії (тільки на стороні гравця для плавності)
-        if (isRunning && !isInvincible) {
-            for (let i = entities.length - 1; i >= 0; i--) {
-                let ent = entities[i];
-                let d = Math.hypot(player.x - ent.x, player.y - ent.y);
-                if (d < player.radius + ent.radius * 0.4) {
-                    if (player.radius > ent.radius) {
-                        player.xp += 45; player.radius += 0.2;
-                        if (isHost) { entities.splice(i, 1); spawnBot(); }
-                        if (player.xp >= player.level * 100) {
-                            player.level++; player.xp = 0;
-                            isRunning = false; isInvincible = true;
-                            document.getElementById('level-up').style.display = 'block';
-                        }
-                    } else {
-                        isRunning = false; deathScreen.style.display = 'flex';
-                    }
-                }
-            }
-        }
-
-        xpFill.style.width = (player.xp / (player.level * 100) * 100) + "%";
-        lvlUi.innerText = player.level;
-        requestAnimationFrame(animate);
     }
 
     window.addEventListener('mousemove', e => { mouse.x = e.clientX; mouse.y = e.clientY; });
